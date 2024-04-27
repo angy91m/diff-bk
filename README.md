@@ -12,7 +12,7 @@
 const diffBk = require('diff-bk');
 const s0 = `\n
 \n
-Lorem ipsum dolor sit amet, consectetur adipiscing elit.
+Lorem 'added' ipsum dolor sit amet, consectetur adipiscing elit.
 Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.
 Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat.
 Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur.
@@ -36,8 +36,9 @@ Integer in mi justo, a sollicitudin orci.
 Duis sed odio sit amet nibh vulputate cursus a sit amet mauris.
 Morbi accumsan ipsum velit. Nam nec tellus a odio tincidunt auctor a ornare odio.
 Sed non mauris vitae erat consequat auctor eu in elit.
-Class aptent taciti sociosqu ad litora torquent per conubia nostra, per inceptos himenaeos.\t`,
-s1 = `Lorem ipsum dolor sit amet, consectetur adipiscing elit.
+Class aptent taciti sociosqu ad litora torquent per conubia nostra, per inceptos himenaeos.\t`;
+
+const s1 = `Lorem ipsum 'removed' dolor sit amet, consectetur adipiscing elit.
 Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.
 Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur.
 Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat.
@@ -68,24 +69,22 @@ console.log(diffs);
 /*
 
 [
-  { del: '\n\n\n' },
-  { eq: 2 },
-  { move: 7 },
-  { eq: 2 },
+  { '-': '\n\n\n' },
+  { m: [ -6, "'added' ", -5, 10, -45 ] },
+  { '=': 1 },
+  { '~': 7 },
+  { '=': 2 },
   {
-    del: 'Fusce dapibus, tellus ac cursus commodo, tortor mauris condimentum nibh, ut fermentum massa justo sit amet risus.\n' +
+    '-': 'Fusce dapibus, tellus ac cursus commodo, tortor mauris condimentum nibh, ut fermentum massa justo sit amet risus.\n' +
       'Etiam pharetra, erat sed fermentum feugiat, velit mauris egestas quam, ut aliquam massa nisl quis neque.'
   },
-  { eq: 1 },
-  { ins: 2 },
-  { eq: 7 },
-  { move: [ 11, 10, 12 ] },
-  { eq: 5 },
-  {
-    del: 'Sed non mauris vitae erat consequat auctor eu in elit.\n' +
-      'Class aptent taciti sociosqu ad litora torquent per conubia nostra, per inceptos himenaeos.\t'
-  },
-  { ins: 1 }
+  { '=': 1 },
+  { '+': 2 },
+  { '=': 7 },
+  { '~': [ 11, 10, 12 ] },
+  { '=': 5 },
+  { '-': 'Sed non mauris vitae erat consequat auctor eu in elit.' },
+  { m: [ -91, '\t' ] }
 ]
 
 */
