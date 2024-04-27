@@ -1,5 +1,7 @@
 use neon::prelude::*;
 use similar::{ChangeTag, TextDiff};
+use diffmatchpatch::{DiffMatchPatch, ToChars, Diff};
+use strsim::normalized_levenshtein;
 use std::{cell::RefCell, rc::Rc};
 
 #[derive(Clone, Debug)]
@@ -20,6 +22,13 @@ impl MoveMut {
             _ => None
         }
     }
+}
+
+#[derive(Clone, Debug)]
+enum ModMut {
+    Eq(usize),
+    Ins(usize),
+    Del(String)
 }
 
 #[derive(Clone, Debug)]
@@ -48,7 +57,8 @@ enum Mutation {
     Del(Rc<String>),
     Ins(InsMut),
     Move(MoveMut),
-    Eq(usize)
+    Eq(usize),
+    Mod(Vec<ModMut>)
 }
 
 impl Mutation {
@@ -100,6 +110,15 @@ impl RestoreResult {
             RestoreResult::MoveDel(x) => x.borrow().clone()
         }
     }
+    fn pop(&mut self) -> Option<char>{
+        match self {
+            RestoreResult::Eq(x) => x.pop(),
+            RestoreResult::Del(x) => x.pop(),
+            RestoreResult::Ins(x) => x.pop(),
+            RestoreResult::MoveIns(x) => x.pop(),
+            RestoreResult::MoveDel(x) => x.borrow_mut().pop()
+        }
+    }
     fn substitute(&mut self, s: &str) {
         match self {
             RestoreResult::Eq(x) => {
@@ -125,6 +144,40 @@ impl RestoreResult {
             }
         }
     }
+}
+
+fn _line_diff(s0: &str, s1: &str) -> Vec<Diff> {
+    let (
+        mut dmp,
+        t0,
+        t1
+    ) = (
+        DiffMatchPatch::new(),
+        s0.to_chars(),
+        s1.to_chars()
+    );
+    dmp.diff_timeout = None;
+    let mut diffs = dmp.diff_main(&t0, &t1, true);
+    dmp.diff_cleanup_efficiency(&mut diffs);
+    diffs
+}
+
+fn _line_patch(s: &str, dfs: &Vec<ModMut> ) -> String {
+    let mut t= s.to_chars();
+    let mut start = 0;
+    for d in dfs {
+        match d {
+            ModMut::Eq(u) => start += u,
+            ModMut::Ins(u) => {t.drain(start..start+u);},
+            ModMut::Del(s) => s.to_chars().iter().for_each(|c| {
+                t.insert(start, c.clone());
+                start +=1;
+            })
+        }
+    }
+    let mut out_s = "".to_string();
+    t.drain(..).for_each(|x| out_s.push(x));
+    out_s
 }
 
 enum RestoreResults {
@@ -239,7 +292,68 @@ fn _str_diff(s0: &str, s1: &str, to_sanitize: bool) -> Vec<Mutation> {
     if eq && eq_len > 0 {
         out.push(Mutation::Eq(eq_len));
     }
-    out
+    let mut filtered_out = vec![];
+    let mut last_mut = None;
+    out.drain(..).for_each(|m|{
+        match m {
+            Mutation::Del(ref mm) => {
+                if let Some(Mutation::Ins(mmm)) = last_mut.as_ref() {
+                    let ins_r = ins_vec.iter().find(|(_, x)| Rc::ptr_eq(x, &mmm.get_ref().unwrap())).unwrap();
+                    if normalized_levenshtein(&mm.to_string(), &ins_r.0) >= 0.5 {
+                        let dfs = _line_diff(&mm.to_string(), &ins_r.0);
+                        let mut ds = vec![];
+                        for d in dfs {
+                            match d {
+                                Diff::Delete(s) => ds.push(ModMut::Del(s.to_string())),
+                                Diff::Insert(s) => ds.push(ModMut::Ins(s.len())),
+                                Diff::Equal(s) => ds.push(ModMut::Eq(s.len()))
+                            }
+                        }
+                        filtered_out.pop();
+                        filtered_out.push(Mutation::Mod(ds));
+                        last_mut = None;
+                    } else {
+                        last_mut = m.clone().into();
+                        filtered_out.push(m);
+                    }
+                } else {
+                    last_mut = m.clone().into();
+                    filtered_out.push(m);
+                }
+            },
+            Mutation::Ins(ref mm) => {
+                if let Some(Mutation::Del(mmm)) = last_mut.as_ref() {
+                    let del_r = del_vec.iter().find(|(x, _, _)| Rc::ptr_eq(x, mmm)).unwrap();
+                    let ins_r = ins_vec.iter().find(|(_, x)| Rc::ptr_eq(x, &mm.get_ref().unwrap())).unwrap();
+                    if normalized_levenshtein(&del_r.0, &ins_r.0) >= 0.5 {
+                        let dfs = _line_diff(&del_r.0, &ins_r.0);
+                        let mut ds = vec![];
+                        for d in dfs {
+                            match d {
+                                Diff::Delete(s) => ds.push(ModMut::Del(s.to_string())),
+                                Diff::Insert(s) => ds.push(ModMut::Ins(s.len())),
+                                Diff::Equal(s) => ds.push(ModMut::Eq(s.len()))
+                            }
+                        }
+                        filtered_out.pop();
+                        filtered_out.push(Mutation::Mod(ds));
+                        last_mut = None;
+                    } else {
+                        last_mut = m.clone().into();
+                        filtered_out.push(m);
+                    }
+                } else {
+                    last_mut = m.clone().into();
+                    filtered_out.push(m);
+                }
+            },
+            mm => {
+                last_mut = None;
+                filtered_out.push(mm);
+            }
+        }
+    });
+    filtered_out
 }
 
 fn _smart_diff(s0: &str, s1: &str, to_sanitize: bool) -> Vec<Mutation> {
@@ -261,10 +375,10 @@ fn _smart_diff(s0: &str, s1: &str, to_sanitize: bool) -> Vec<Mutation> {
     for m in muts {
         match m {
             Mutation::Del(s) => {
-                if last == "ins" {
+                if last == "+" {
                     out.push(Mutation::Ins(InsMut::Multi(curr_ins.len() as f64)));
                     curr_ins.truncate(0);
-                } else if last == "move" {
+                } else if last == "~" {
                     out.push(Mutation::Move(if curr_move.len() > 1 {
                         MoveMut::Multi(curr_move.clone())
                     } else {
@@ -272,15 +386,15 @@ fn _smart_diff(s0: &str, s1: &str, to_sanitize: bool) -> Vec<Mutation> {
                     }));
                     curr_move.truncate(0);
                 }
-                last = "del";
+                last = "-";
                 curr_str.push_str(&((*s).clone() + "\n"));
             },
             Mutation::Ins(s) => {
-                if last == "del" {
+                if last == "-" {
                     curr_str.pop();
                     out.push(Mutation::Del(Rc::new(curr_str.clone())));
                     curr_str.truncate(0);
-                } else if last == "move" {
+                } else if last == "~" {
                     out.push(Mutation::Move(if curr_move.len() > 1 {
                         MoveMut::Multi(curr_move.clone())
                     } else {
@@ -288,30 +402,30 @@ fn _smart_diff(s0: &str, s1: &str, to_sanitize: bool) -> Vec<Mutation> {
                     }));
                     curr_move.truncate(0);
                 }
-                last = "ins";
+                last = "+";
                 curr_ins.push(s);
             },
             Mutation::Move(n) => {
-                if last == "del" {
+                if last == "-" {
                     curr_str.pop();
                     out.push(Mutation::Del(Rc::new(curr_str.clone())));
                     curr_str.truncate(0);
-                } else if last == "ins" {
+                } else if last == "+" {
                     out.push(Mutation::Ins(InsMut::Multi(curr_ins.len() as f64)));
                     curr_ins.truncate(0);
                 }
-                last = "move";
+                last = "~";
                 curr_move.push(n.get_val().unwrap());
             }
             mm => {
-                if last == "del" {
+                if last == "-" {
                     curr_str.pop();
                     out.push(Mutation::Del(Rc::new(curr_str.clone())));
                     curr_str.truncate(0);
-                } else if last == "ins" {
+                } else if last == "+" {
                     out.push(Mutation::Ins(InsMut::Multi(curr_ins.len() as f64)));
                     curr_ins.truncate(0);
-                } else if last == "move" {
+                } else if last == "~" {
                     out.push(Mutation::Move(if curr_move.len() > 1 {
                         MoveMut::Multi(curr_move.clone())
                     } else {
@@ -324,12 +438,12 @@ fn _smart_diff(s0: &str, s1: &str, to_sanitize: bool) -> Vec<Mutation> {
             }
         }
     }
-    if last == "del" && curr_str.len() > 0 {
+    if last == "-" && curr_str.len() > 0 {
         curr_str.pop();
         out.push(Mutation::Del(Rc::new(curr_str.clone())));
-    } else if last == "ins" && curr_ins.len() > 0 {
+    } else if last == "+" && curr_ins.len() > 0 {
         out.push(Mutation::Ins(InsMut::Multi(curr_ins.len() as f64)));
-    } else if last == "move" && curr_move.len() > 0 {
+    } else if last == "~" && curr_move.len() > 0 {
         out.push(Mutation::Move(if curr_move.len() > 1 {
             MoveMut::Multi(curr_move.clone())
         } else {
@@ -355,33 +469,53 @@ macro_rules! jsonize_muts {
             match m {
                 Mutation::Del(v) => {
                     let v = $cx.string((*v).clone());
-                    obj.set(&mut $cx, "del", v)?;
+                    obj.set(&mut $cx, "-", v)?;
                 },
                 Mutation::Ins(v) => {
                     if let Some(v) = v.get_val() {
                         let v = $cx.number(v);
-                        obj.set(&mut $cx, "ins", v)?;
+                        obj.set(&mut $cx, "+", v)?;
                     } else {
                         let v = $cx.number(1);
-                        obj.set(&mut $cx, "ins", v)?;
+                        obj.set(&mut $cx, "+", v)?;
                     }
                 },
                 Mutation::Eq(v) => {
                     let v = $cx.number(v.clone() as u32);
-                    obj.set(&mut $cx, "eq", v)?;
+                    obj.set(&mut $cx, "=", v)?;
                 },
                 Mutation::Move(v) => {
                     if let Some(x) = v.get_val() {
                         let v = $cx.number(x as u32);
-                        obj.set(&mut $cx, "move", v)?;
+                        obj.set(&mut $cx, "~", v)?;
                     } else {
                         let (x, arr) = (v.get_vec().unwrap(), $cx.empty_array());
                         for i in x {
                             let (v, l) = ($cx.number(i as u32), arr.len(&mut $cx));
                             arr.set(&mut $cx, l, v)?;
                         }
-                        obj.set(&mut $cx, "move", arr)?;
+                        obj.set(&mut $cx, "~", arr)?;
                     };
+                },
+                Mutation::Mod(v) => {
+                    let arr = $cx.empty_array();
+                    for i in v {
+                        match i {
+                            ModMut::Del(s) => {
+                                let (v,l) = ($cx.string(&s), arr.len(&mut $cx));
+                                arr.set(&mut $cx, l, v)?;
+                            },
+                            ModMut::Eq(u) => {
+                                let (v, l) = ($cx.number(-(u as i32)), arr.len(&mut $cx));
+                                arr.set(&mut $cx, l, v)?;
+                            },
+                            ModMut::Ins(u) => {
+                                let (v, l) = ($cx.number(u as i32), arr.len(&mut $cx));
+                                arr.set(&mut $cx, l, v)?;
+                            }
+                        }
+                    }
+                    obj.set(&mut $cx, "m", arr)?;
                 }
             }
             out_arr.set(&mut $cx, l, obj)?;
@@ -467,7 +601,7 @@ fn _restore(s: &str, muts: &[Mutation], sanitize: bool, to_json: bool) -> Restor
             next_ind = x.1 + 1;
         });
     }
-    for m in muts {
+    for (m_ind, m) in muts.iter().enumerate() {
         match m {
             Mutation::Del(s) => {
                 let mut cs = "".to_string();
@@ -493,6 +627,9 @@ fn _restore(s: &str, muts: &[Mutation], sanitize: bool, to_json: bool) -> Restor
                     out_vec.insert(line_count, s.to_string());
                     line_count += 1;
                 });
+                if muts.len() - 1 == m_ind {
+                    cs.pop();
+                }
                 out_struct.push(RestoreResult::Del(cs));
             },
             Mutation::Ins(i) => {
@@ -514,6 +651,9 @@ fn _restore(s: &str, muts: &[Mutation], sanitize: bool, to_json: bool) -> Restor
                 for _ in 0..i {
                     let s = out_vec.remove(line_count);
                     r.push_str(&(s + "\n"));
+                }
+                if muts.len() - 1 == m_ind {
+                    r.pop();
                 }
                 out_struct.push(r);
             },
@@ -550,7 +690,7 @@ fn _restore(s: &str, muts: &[Mutation], sanitize: bool, to_json: bool) -> Restor
                         }
                     });
                     last_m.2.as_mut().unwrap().substitute(&ns);
-                    out_struct.push(RestoreResult::MoveIns(s.clone() + "\n"));
+                    out_struct.push(RestoreResult::MoveIns(s.clone() + ( if muts.len() -1 == m_ind {""} else {"\n"})));
                     to_move.push((n, s));
                 } else {
                     let mut r = RestoreResult::MoveIns("".to_string());
@@ -571,6 +711,9 @@ fn _restore(s: &str, muts: &[Mutation], sanitize: bool, to_json: bool) -> Restor
                         r.push_str(&(s.clone() + "\n"));
                         to_move.push((*n, s));
                     });
+                    if muts.len() - 1 == m_ind {
+                        r.pop();
+                    }
                     out_struct.push(r);
                 }
             },
@@ -598,6 +741,51 @@ fn _restore(s: &str, muts: &[Mutation], sanitize: bool, to_json: bool) -> Restor
                     line_count += 1;
                 }
                 out_struct.push(RestoreResult::Eq(cs));
+            },
+            Mutation::Mod(v) => {
+                let s = out_vec.remove(line_count);
+                let ns = _line_patch(&s, v);
+                out_vec.insert(line_count, ns);
+                line_count += 1;
+                let mut c_count = 0;
+                for m in v {
+                    match m {
+                        ModMut::Del(x) => {
+                            if let Some(RestoreResult::Del(_)) = out_struct.last() {
+                                out_struct.last_mut().unwrap().push_str(x);
+                            } else {
+                                out_struct.push(RestoreResult::Del(x.clone()));
+                            }
+                        },
+                        ModMut::Ins(x) => {
+                            if let Some(RestoreResult::Ins(_)) = out_struct.last() {
+                                let last_r = out_struct.last_mut().unwrap();
+                                s.to_chars().drain(c_count..c_count+x).for_each(|x| last_r.push_str(&x.to_string()));
+                                c_count += x;
+                            } else {
+                                let mut this_s = "".to_string();
+                                s.to_chars().drain(c_count..c_count+x).for_each(|x| this_s.push(x));
+                                c_count += x;
+                                out_struct.push(RestoreResult::Ins(this_s));
+                            }
+                        },
+                        ModMut::Eq(x) => {
+                            if let Some(RestoreResult::Eq(_)) = out_struct.last() {
+                                let last_r = out_struct.last_mut().unwrap();
+                                s.to_chars().drain(c_count..c_count+x).for_each(|x| last_r.push_str(&x.to_string()));
+                                c_count += x;
+                            } else {
+                                let mut this_s = "".to_string();
+                                s.to_chars().drain(c_count..c_count+x).for_each(|x| this_s.push(x));
+                                c_count += x;
+                                out_struct.push(RestoreResult::Eq(this_s));
+                            }
+                        }
+                    }
+                }
+                if v.len() > 0 && muts.len() -1 != m_ind {
+                    out_struct.last_mut().unwrap().push_str("\n");
+                }
             }
         }
     }
@@ -617,20 +805,36 @@ macro_rules! rustify_muts {
         for m in $muts {
             let obj = m.downcast::<JsObject,_>(&mut $cx).unwrap();
             o.push(
-                if let Ok(v) = obj.get_value(&mut $cx, "del")?.downcast::<JsString,_>(&mut $cx) {
+                if let Ok(v) = obj.get_value(&mut $cx, "-")?.downcast::<JsString,_>(&mut $cx) {
                     Mutation::Del(Rc::new(v.value(&mut $cx)))
-                } else if let Ok(v) = obj.get_value(&mut $cx, "ins")?.downcast::<JsNumber,_>(&mut $cx) {
+                } else if let Ok(v) = obj.get_value(&mut $cx, "+")?.downcast::<JsNumber,_>(&mut $cx) {
                     Mutation::Ins(InsMut::Multi(v.value(&mut $cx)))
-                } else if let Ok(v) = obj.get_value(&mut $cx, "move")?.downcast::<JsNumber,_>(&mut $cx) {
+                } else if let Ok(v) = obj.get_value(&mut $cx, "~")?.downcast::<JsNumber,_>(&mut $cx) {
                     Mutation::Move(MoveMut::Single(v.value(&mut $cx) as usize))
-                } else if let Ok(v) = obj.get_value(&mut $cx, "move")?.downcast::<JsArray,_>(&mut $cx) {
+                } else if let Ok(v) = obj.get_value(&mut $cx, "~")?.downcast::<JsArray,_>(&mut $cx) {
                     Mutation::Move(MoveMut::Multi(
                         v.to_vec(&mut $cx)?.iter()
                         .map(|x| x.downcast::<JsNumber,_>(&mut $cx).unwrap().value(&mut $cx) as usize )
                         .collect::<Vec<usize>>()
                     ))
+                } else if let Ok(v) = obj.get_value(&mut $cx, "m")?.downcast::<JsArray,_>(&mut $cx) {
+                    let v = v.to_vec(&mut $cx)?;
+                    let mut this_v = vec![];
+                    for x in v {
+                        if let Ok(v) = x.downcast::<JsString,_>(&mut $cx) {
+                            this_v.push(ModMut::Del(v.value(&mut $cx)));
+                        } else {
+                            let v = x.downcast::<JsNumber,_>(&mut $cx).unwrap().value(&mut $cx);
+                            if (v > 0.0) {
+                                this_v.push(ModMut::Ins(v as usize));
+                            } else {
+                                this_v.push(ModMut::Eq( v.abs() as usize ));
+                            }
+                        }
+                    }
+                    Mutation::Mod(this_v)
                 } else {
-                    let v = obj.get::<JsNumber,_,_>(&mut $cx, "eq")?;
+                    let v = obj.get::<JsNumber,_,_>(&mut $cx, "=")?;
                     Mutation::Eq(v.value(&mut $cx) as usize)
                 }
             );
